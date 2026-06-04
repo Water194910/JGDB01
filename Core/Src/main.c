@@ -16,13 +16,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "user_uart.h"
-#include "fashion_star_uart_servo.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
 #include "gm6020_can.h"
+#include "pid.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,10 +43,13 @@
 #define GIMBAL_X_KP_DEFAULT     0.5f     // X轴位置环KP
 #define GIMBAL_X_KI_DEFAULT     0.0f     // X轴位置环KI
 #define GIMBAL_X_KD_DEFAULT     0.0f     // X轴位置环KD
-#define GIMBAL_X_SPEED_KP_DEFAULT 3.0f   // X轴速度环KP
-#define GIMBAL_X_SPEED_KI_DEFAULT 1.2f   // X轴速度环KI
-#define GIMBAL_X_SPEED_KD_DEFAULT 0.0f   // X轴速度环KD
-#define GIMBAL_Y_KP_DEFAULT     0.03f    // Y轴KP
+#define GIMBAL_X_SPEED_KP_DEFAULT 50.0f  // X轴速度环KP（RPM速度环）
+#define GIMBAL_X_SPEED_KI_DEFAULT 2.0f   // X轴速度环KI（RPM速度环）
+#define GIMBAL_X_SPEED_KD_DEFAULT 6.0f   // X轴速度环KD（RPM速度环）
+#define GIMBAL_Y_KP_DEFAULT     0.5f     // Y轴位置环KP
+#define GIMBAL_Y_KI_DEFAULT     0.0f     // Y轴位置环KI
+#define GIMBAL_Y_KD_DEFAULT     0.0f     // Y轴位置环KD
+#define GIMBAL_Y_TARGET_KP_DEFAULT 0.03f // Y轴视觉目标增量比例
 #define GIMBAL_DEADZONE         8        // 死区像素
 #define GIMBAL_Y_DELTA_MAX      2.0f     // Y轴单次最大角度增量
 #define GIMBAL_BOOST_THRESHOLD   10.0f    // boost启动阈值（度）
@@ -59,22 +61,19 @@
 #define GIMBAL_X_MAX            540.0f   // X轴最大角度（1.5圈）
 #define GIMBAL_Y_MAX            20.0f    // Y轴最大角度
 #define GIMBAL_Y_MIN            -20.0f   // Y轴最小角度
-#define SERVO_ID                0        // Y轴舵机ID
-#define SERVO_INTERVAL          50       // 舵机运动时间ms
-#define SERVO_POWER             1000     // 舵机功率
-
 // 串口调参缓冲区
 // Flash参数存储
 #define FLASH_SAVE_ADDR         0x08060000   // Sector7起始地址
 #define FLASH_SAVE_MAGIC        0x594E494C   // "LINY" 灵犀的校验头
-#define FLASH_SAVE_VERSION      1
+#define FLASH_SAVE_VERSION      4
 
 typedef struct {
   uint32_t magic;
   uint32_t version;
   float x_kp, x_ki, x_kd;
   float x_speed_kp, x_speed_ki, x_speed_kd;
-  float y_kp;
+  float y_kp, y_ki, y_kd;
+  float y_target_kp;
   float boost_threshold, boost_gain, boost_max;
   float boost_px_threshold;
   float x_delta_max_boost;
@@ -98,8 +97,9 @@ volatile uint8_t dbg_cmd_ready = 0;
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-// GM6020 X轴
-pid pid_sd, pid_wz;
+// GM6020 X/Y轴
+PID_TypeDef pid_x_speed, pid_x_pos;
+PID_TypeDef pid_y_speed, pid_y_pos;
 int out;
 float sd;
 uint8_t time_ms = 0;
@@ -113,6 +113,9 @@ float gimbal_x_speed_kp = GIMBAL_X_SPEED_KP_DEFAULT;
 float gimbal_x_speed_ki = GIMBAL_X_SPEED_KI_DEFAULT;
 float gimbal_x_speed_kd = GIMBAL_X_SPEED_KD_DEFAULT;
 float gimbal_y_kp = GIMBAL_Y_KP_DEFAULT;
+float gimbal_y_ki = GIMBAL_Y_KI_DEFAULT;
+float gimbal_y_kd = GIMBAL_Y_KD_DEFAULT;
+float gimbal_y_target_kp = GIMBAL_Y_TARGET_KP_DEFAULT;
 float gimbal_boost_threshold = GIMBAL_BOOST_THRESHOLD;
 float gimbal_boost_gain = GIMBAL_BOOST_GAIN;
 float gimbal_boost_max = GIMBAL_BOOST_MAX;
@@ -138,13 +141,8 @@ float gimbal_x_angle = 0.0f;    // X轴当前角度
 float gimbal_y_angle = 0.0f;    // Y轴当前角度
 float gimbal_x_target = 0.0f;   // X轴目标角度
 float gimbal_y_target = 0.0f;   // Y轴目标角度
-float gimbal_x_err_sum = 0.0f;  // X轴位置误差积分
-float gimbal_y_err_sum = 0.0f;  // Y轴误差积分
-float gimbal_x_err_last = 0.0f; // X轴位置上次误差
-float gimbal_y_err_last = 0.0f; // Y轴上次误差
 float gimbal_x_speed_target = 0.0f;  // 位置环输出的目标速度
-volatile uint8_t gimbal_speed_test_mode = 0;  // 速度环测试模式标志
-float gimbal_speed_test_val = 0.0f;  // 测试目标转速（度/秒）
+float gimbal_y_speed_target = 0.0f;  // 位置环输出的目标速度
 
 /* USER CODE END PV */
 
@@ -152,7 +150,6 @@ float gimbal_speed_test_val = 0.0f;  // 测试目标转速（度/秒）
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void Gimbal_ProcessCamData(void);
-float Gimbal_CalcPID(float kp, float ki, float kd, float error, float *err_sum, float *err_last);
 void HAL_TIM3_PeriodElapsedCallback(void);
 void Debug_ParseCommand(uint8_t *cmd, uint16_t len);
 void Debug_PrintParams(void);
@@ -195,6 +192,9 @@ void FlashParams_Save(void)
   params.x_speed_ki = gimbal_x_speed_ki;
   params.x_speed_kd = gimbal_x_speed_kd;
   params.y_kp = gimbal_y_kp;
+  params.y_ki = gimbal_y_ki;
+  params.y_kd = gimbal_y_kd;
+  params.y_target_kp = gimbal_y_target_kp;
   params.boost_threshold = gimbal_boost_threshold;
   params.boost_gain = gimbal_boost_gain;
   params.boost_max = gimbal_boost_max;
@@ -261,6 +261,9 @@ void FlashParams_Load(void)
   gimbal_x_speed_ki = params->x_speed_ki;
   gimbal_x_speed_kd = params->x_speed_kd;
   gimbal_y_kp = params->y_kp;
+  gimbal_y_ki = params->y_ki;
+  gimbal_y_kd = params->y_kd;
+  gimbal_y_target_kp = params->y_target_kp;
   gimbal_boost_threshold = params->boost_threshold;
   gimbal_boost_gain = params->boost_gain;
   gimbal_boost_max = params->boost_max;
@@ -269,6 +272,187 @@ void FlashParams_Load(void)
   gimbal_poserr_guard_boost = params->poserr_guard_boost;
 
   HAL_UART_Transmit(&huart1, (uint8_t *)"已从Flash加载参数 ✓\r\n", 20, 100);
+}
+
+/**
+ * @brief 浮点转字符串，避免部分newlib-nano配置下printf不支持%f
+ */
+static void ftoa(float val, char *out, int decimals)
+{
+  if (val < 0.0f) {
+    *out++ = '-';
+    val = -val;
+  }
+
+  int ipart = (int)val;
+  float fpart = val - (float)ipart;
+  char tmp[16];
+  int i = 0;
+
+  if (ipart == 0) {
+    tmp[i++] = '0';
+  } else {
+    while (ipart > 0 && i < (int)sizeof(tmp)) {
+      tmp[i++] = (char)('0' + (ipart % 10));
+      ipart /= 10;
+    }
+  }
+
+  while (--i >= 0) {
+    *out++ = tmp[i];
+  }
+
+  if (decimals > 0) {
+    *out++ = '.';
+    while (decimals-- > 0) {
+      fpart *= 10.0f;
+      *out++ = (char)('0' + ((int)fpart % 10));
+    }
+  }
+
+  *out = '\0';
+}
+
+/**
+ * @brief 打印当前调参参数
+ */
+void Debug_PrintParams(void)
+{
+  char buf[360];
+  char xkp[12], xki[12], xkd[12];
+  char xsp[12], xsi[12], xsd[12];
+  char ykp[12], yki[12], ykd[12], ytp[12];
+  char bt[12], bg[12], bm[12], bp[12], bd[12], be[12];
+
+  ftoa(gimbal_x_kp, xkp, 3);
+  ftoa(gimbal_x_ki, xki, 3);
+  ftoa(gimbal_x_kd, xkd, 3);
+  ftoa(gimbal_x_speed_kp, xsp, 3);
+  ftoa(gimbal_x_speed_ki, xsi, 3);
+  ftoa(gimbal_x_speed_kd, xsd, 3);
+  ftoa(gimbal_y_kp, ykp, 3);
+  ftoa(gimbal_y_ki, yki, 3);
+  ftoa(gimbal_y_kd, ykd, 3);
+  ftoa(gimbal_y_target_kp, ytp, 3);
+  ftoa(gimbal_boost_threshold, bt, 3);
+  ftoa(gimbal_boost_gain, bg, 3);
+  ftoa(gimbal_boost_max, bm, 3);
+  ftoa(gimbal_boost_px_threshold, bp, 1);
+  ftoa(gimbal_x_delta_max_boost, bd, 3);
+  ftoa(gimbal_poserr_guard_boost, be, 3);
+
+  int len = snprintf(buf, sizeof(buf),
+                     "\r\n=== 当前参数 ===\r\n"
+                     "X位置: KP=%s KI=%s KD=%s\r\n"
+                     "X速度: KP=%s KI=%s KD=%s\r\n"
+                     "Y位置: KP=%s KI=%s KD=%s\r\n"
+                     "Y目标比例: KP=%s\r\n"
+                     "Boost: BT=%s BG=%s BM=%s BP=%s BD=%s BE=%s\r\n"
+                     "================\r\n",
+                     xkp, xki, xkd, xsp, xsi, xsd, ykp, yki, ykd, ytp,
+                     bt, bg, bm, bp, bd, be);
+  if (len > 0) {
+    if (len > (int)sizeof(buf)) {
+      len = sizeof(buf);
+    }
+    HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)len, 200);
+  }
+}
+
+/**
+ * @brief 解析串口调参命令
+ */
+void Debug_ParseCommand(uint8_t *cmd, uint16_t len)
+{
+  if (len == 0) {
+    return;
+  }
+
+  if (strcmp((char *)cmd, "PID") == 0) {
+    Debug_PrintParams();
+    return;
+  }
+
+  if (strcmp((char *)cmd, "SAVE") == 0) {
+    FlashParams_Save();
+    return;
+  }
+
+  float value = 0.0f;
+  uint8_t updated_pid = 0;
+
+  if ((cmd[0] == 'X' || cmd[0] == 'x') && len >= 3) {
+    if ((cmd[1] == 'S' || cmd[1] == 's') && len >= 4) {
+      value = atof((char *)&cmd[3]);
+      switch (cmd[2]) {
+        case 'p': case 'P': gimbal_x_speed_kp = value; updated_pid = 1; break;
+        case 'i': case 'I': gimbal_x_speed_ki = value; updated_pid = 1; break;
+        case 'd': case 'D': gimbal_x_speed_kd = value; updated_pid = 1; break;
+        default: break;
+      }
+      if (updated_pid) {
+        PID_Init(&pid_x_speed, gimbal_x_speed_kp, gimbal_x_speed_ki, gimbal_x_speed_kd);
+        PID_Init(&pid_y_speed, gimbal_x_speed_kp, gimbal_x_speed_ki, gimbal_x_speed_kd);
+      }
+    } else {
+      value = atof((char *)&cmd[2]);
+      switch (cmd[1]) {
+        case 'p': case 'P': gimbal_x_kp = value; updated_pid = 1; break;
+        case 'i': case 'I': gimbal_x_ki = value; updated_pid = 1; break;
+        case 'd': case 'D': gimbal_x_kd = value; updated_pid = 1; break;
+        default: break;
+      }
+      if (updated_pid) {
+        PID_Init(&pid_x_pos, gimbal_x_kp, gimbal_x_ki, gimbal_x_kd);
+      }
+    }
+  } else if ((cmd[0] == 'Y' || cmd[0] == 'y') && len >= 3) {
+    if ((cmd[1] == 'T' || cmd[1] == 't') && len >= 4) {
+      value = atof((char *)&cmd[3]);
+      if (cmd[2] == 'P' || cmd[2] == 'p') {
+        gimbal_y_target_kp = value;
+        updated_pid = 1;
+      }
+    } else {
+      value = atof((char *)&cmd[2]);
+      switch (cmd[1]) {
+        case 'p': case 'P': gimbal_y_kp = value; updated_pid = 1; break;
+        case 'i': case 'I': gimbal_y_ki = value; updated_pid = 1; break;
+        case 'd': case 'D': gimbal_y_kd = value; updated_pid = 1; break;
+        default: break;
+      }
+      if (updated_pid) {
+        PID_Init(&pid_y_pos, gimbal_y_kp, gimbal_y_ki, gimbal_y_kd);
+      }
+    }
+  } else if ((cmd[0] == 'B' || cmd[0] == 'b') && len >= 3) {
+    value = atof((char *)&cmd[2]);
+    switch (cmd[1]) {
+      case 't': case 'T': gimbal_boost_threshold = value; updated_pid = 1; break;
+      case 'g': case 'G': gimbal_boost_gain = value; updated_pid = 1; break;
+      case 'm': case 'M': gimbal_boost_max = value; updated_pid = 1; break;
+      case 'p': case 'P': gimbal_boost_px_threshold = value; updated_pid = 1; break;
+      case 'd': case 'D': gimbal_x_delta_max_boost = value; updated_pid = 1; break;
+      case 'e': case 'E': gimbal_poserr_guard_boost = value; updated_pid = 1; break;
+      default: break;
+    }
+  }
+
+  if (updated_pid) {
+    char buf[64];
+    char vstr[12];
+    ftoa(value, vstr, 3);
+    int l = snprintf(buf, sizeof(buf), "已设置: %s = %s\r\n", (char *)cmd, vstr);
+    if (l > 0) {
+      if (l > (int)sizeof(buf)) {
+        l = sizeof(buf);
+      }
+      HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)l, 100);
+    }
+    Debug_PrintParams();
+  } else {
+    HAL_UART_Transmit(&huart1, (uint8_t *)"未知命令\r\n", strlen("未知命令\r\n"), 100);
+  }
 }
 
 /* USER CODE END 0 */
@@ -303,27 +487,20 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_USART2_UART_Init();
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
   MX_TIM2_Init();
   MX_CAN1_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  // 初始化舵机串口
-  User_Uart_Init(&huart2);
-  HAL_UART_Transmit(&huart1, (uint8_t *)"USART2 init OK\r\n", 16, 100);
-
-  // 舵机上电初始化（必须！等待1秒→卸力→重置圈数）
-  FSUS_INIT();
-  HAL_UART_Transmit(&huart1, (uint8_t *)"舵机初始化完成\r\n", strlen("舵机初始化完成\r\n"), 100);
-
-  // 从Flash加载上次保存的参数（必须在Pid_Init之前）
+  // 从Flash加载上次保存的参数（必须在PID_Init之前）
   FlashParams_Load();
 
   // 初始化GM6020电机PID（使用动态参数）
-  Pid_Init(&pid_sd, gimbal_x_speed_kp, gimbal_x_speed_ki, gimbal_x_speed_kd);  //速度环
-  Pid_Init(&pid_wz, gimbal_x_kp, gimbal_x_ki, gimbal_x_kd);  //位置环
+  PID_Init(&pid_x_speed, gimbal_x_speed_kp, gimbal_x_speed_ki, gimbal_x_speed_kd);  // X速度环
+  PID_Init(&pid_x_pos, gimbal_x_kp, gimbal_x_ki, gimbal_x_kd);  // X位置环
+  PID_Init(&pid_y_speed, gimbal_x_speed_kp, gimbal_x_speed_ki, gimbal_x_speed_kd);  // Y速度环，与X轴相同参数
+  PID_Init(&pid_y_pos, gimbal_y_kp, gimbal_y_ki, gimbal_y_kd);  // Y位置环
 
   // 启动USART1中断接收（用于串口调参）
   if (HAL_UART_Receive_IT(&huart1, &dbg_rx_buf[0], 1) != HAL_OK) {
@@ -335,11 +512,13 @@ int main(void)
   HAL_UART_Transmit(&huart1, (uint8_t *)"XP1.5  - X轴位置环KP\r\n", 23, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"XI0.1  - X轴位置环KI\r\n", 23, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"XD0.05 - X轴位置环KD\r\n", 24, 100);
-  HAL_UART_Transmit(&huart1, (uint8_t *)"XSP3.0 - X轴速度环KP\r\n", 23, 100);
-  HAL_UART_Transmit(&huart1, (uint8_t *)"XSI1.0 - X轴速度环KI\r\n", 23, 100);
-  HAL_UART_Transmit(&huart1, (uint8_t *)"XSD0.0 - X轴速度环KD\r\n", 23, 100);
-  HAL_UART_Transmit(&huart1, (uint8_t *)"YP0.03 - Y轴KP\r\n", 17, 100);
-  HAL_UART_Transmit(&huart1, (uint8_t *)"T100   - 测试转速(°/s), T0退出\r\n", 30, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"XSP50  - X轴速度环KP\r\n", 23, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"XSI2.0 - X轴速度环KI\r\n", 23, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"XSD6.0 - X轴速度环KD\r\n", 23, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"YP0.5  - Y轴位置环KP\r\n", 23, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"YI0.0  - Y轴位置环KI\r\n", 23, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"YD0.0  - Y轴位置环KD\r\n", 23, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"YTP0.03- Y轴视觉目标比例\r\n", 27, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"BT10   - boost阈值(°)\r\n", 23, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"BG0.05 - boost增益\r\n", 19, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"BM3.0  - boost上限\r\n", 19, 100);
@@ -363,12 +542,10 @@ int main(void)
   // 不归零，保持电机当前位置
   gimbal_x_target = motor_date[0].total_du;
   gimbal_x_angle = motor_date[0].total_du;
+  gimbal_y_target = motor_date[1].total_du;
+  gimbal_y_angle = motor_date[1].total_du;
 
-  HAL_UART_Transmit(&huart1, (uint8_t *)"GM6020保持当前位置\r\n", strlen("GM6020保持当前位置\r\n"), 100);
-
-  // 初始化舵机到中位
-  gimbal_y_target = 0.0f;
-  FSUS_SetServoAngle(&FSUS_usart2, SERVO_ID, 0.0f, SERVO_INTERVAL, SERVO_POWER);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"GM6020 X/Y保持当前位置\r\n", strlen("GM6020 X/Y保持当前位置\r\n"), 100);
 
   HAL_UART_Transmit(&huart1, (uint8_t *)"云台初始化完成\r\n", strlen("云台初始化完成\r\n"), 100);
   /* USER CODE END 2 */
@@ -407,26 +584,6 @@ int main(void)
         }
         i++;
       }
-    }
-
-    // Y轴舵机控制（每100ms更新一次，避免过于频繁）
-    static uint16_t servo_cnt = 0;
-    static float last_y_cmd = 0.0f;
-    servo_cnt++;
-    if (servo_cnt >= 10) {  // 10ms * 10 = 100ms
-      servo_cnt = 0;
-
-      // 限幅保护（双保险）
-      float y_cmd = gimbal_y_target;
-      if (y_cmd > GIMBAL_Y_MAX) y_cmd = GIMBAL_Y_MAX;
-      if (y_cmd < GIMBAL_Y_MIN) y_cmd = GIMBAL_Y_MIN;
-
-      // 只有当目标变化超过0.5度时才发送指令，减少抖动
-      if (fabsf(y_cmd - last_y_cmd) > 0.5f) {
-        FSUS_SetServoAngle(&FSUS_usart2, SERVO_ID, y_cmd, SERVO_INTERVAL, SERVO_POWER);
-        last_y_cmd = y_cmd;
-      }
-      gimbal_y_angle = y_cmd;
     }
 
     // 处理串口调参命令
@@ -526,9 +683,9 @@ void Gimbal_ProcessCamData(void)
       }
     }
 
-    // Y轴：保持不变
+    // Y轴：视觉偏差更新GM6020目标角度
     if (abs(cam_dy) > GIMBAL_DEADZONE) {
-      float y_delta = cam_dy * gimbal_y_kp;
+      float y_delta = cam_dy * gimbal_y_target_kp;
       if (y_delta > GIMBAL_Y_DELTA_MAX) y_delta = GIMBAL_Y_DELTA_MAX;
       if (y_delta < -GIMBAL_Y_DELTA_MAX) y_delta = -GIMBAL_Y_DELTA_MAX;
       gimbal_y_target += y_delta;
@@ -550,46 +707,52 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
     // 速度环：每2ms执行一次
     if (time_ms % 2 == 0) {
-      // 速度环：根据速度计算电压
-      float x_speed_error = gimbal_x_speed_target - motor_date[0].rotor_du_speed;
-      int16_t x_voltage = (int16_t)Gimbal_CalcPID(pid_sd.Kp, pid_sd.Ki, pid_sd.Kd,
-                                                   x_speed_error, &pid_sd.err_sum, &pid_sd.err_last);
+      // 速度环使用RPM单位，与参考工程保持一致
+      float x_speed_target_rpm = gimbal_x_speed_target / RPM_TO_DEGS;
+      float y_speed_target_rpm = gimbal_y_speed_target / RPM_TO_DEGS;
+      int16_t x_voltage = (int16_t)PID_SpeedLoop(&pid_x_speed,
+                                                  (float)motor_date[0].rotor_speed,
+                                                  x_speed_target_rpm);
+      int16_t y_voltage = (int16_t)PID_SpeedLoop(&pid_y_speed,
+                                                  (float)motor_date[1].rotor_speed,
+                                                  y_speed_target_rpm);
 
       // 限幅
       if (x_voltage > 25000) x_voltage = 25000;
       if (x_voltage < -25000) x_voltage = -25000;
+      if (y_voltage > 25000) y_voltage = 25000;
+      if (y_voltage < -25000) y_voltage = -25000;
 
-      CAN_Transmit(x_voltage, 0, 0, 0, Voltage);
+      CAN_Transmit(x_voltage, y_voltage, 0, 0, Voltage);
     }
 
     // 位置环：每10ms执行一次
     if (time_ms >= 10) {
-      if (gimbal_speed_test_mode) {
-        // 测试模式：直接使用串口设定的目标转速
-        gimbal_x_speed_target = gimbal_speed_test_val;
-      } else {
-        // 位置环积分防饱和：boost状态切换时清零
-        static uint8_t pid_last_boost = 0;
-        if (gimbal_x_boost_active != pid_last_boost) {
-          gimbal_x_err_sum = 0.0f;
-          pid_last_boost = gimbal_x_boost_active;
-        }
+      // 位置环积分防饱和：boost状态切换时清零
+      static uint8_t pid_last_boost = 0;
+      if (gimbal_x_boost_active != pid_last_boost) {
+        pid_x_pos.err_sum = 0.0f;
+        pid_last_boost = gimbal_x_boost_active;
+      }
 
-        // 正常模式：位置环根据角度偏差计算目标转速
-        float x_error = gimbal_x_target - motor_date[0].total_du;
-        gimbal_x_speed_target = Gimbal_CalcPID(gimbal_x_kp, gimbal_x_ki, gimbal_x_kd,
-                                                x_error, &gimbal_x_err_sum, &gimbal_x_err_last);
-        // boost：像素偏移大时加速追赶（仅追踪模式）
-        float cam_dx_abs = (float)(abs(cam_dx));
-        if (cam_cmd == CAM_CMD_TRACK && cam_dx_abs > gimbal_boost_px_threshold) {
-          float boost = 1.0f + (cam_dx_abs - gimbal_boost_px_threshold) * gimbal_boost_gain;
-          if (boost > gimbal_boost_max) boost = gimbal_boost_max;
-          gimbal_x_speed_target *= boost;
-        }
+      // 正常模式：位置环根据角度偏差计算目标转速（deg/s）
+      gimbal_x_speed_target = PID_PositionLoop(&pid_x_pos,
+                                                motor_date[0].total_du,
+                                                gimbal_x_target);
+      gimbal_y_speed_target = PID_PositionLoop(&pid_y_pos,
+                                                motor_date[1].total_du,
+                                                gimbal_y_target);
+      // boost：像素偏移大时加速追赶（仅追踪模式）
+      float cam_dx_abs = (float)(abs(cam_dx));
+      if (cam_cmd == CAM_CMD_TRACK && cam_dx_abs > gimbal_boost_px_threshold) {
+        float boost = 1.0f + (cam_dx_abs - gimbal_boost_px_threshold) * gimbal_boost_gain;
+        if (boost > gimbal_boost_max) boost = gimbal_boost_max;
+        gimbal_x_speed_target *= boost;
       }
 
       // 更新当前角度
       gimbal_x_angle = motor_date[0].total_du;
+      gimbal_y_angle = motor_date[1].total_du;
 
       time_ms = 0;
     }

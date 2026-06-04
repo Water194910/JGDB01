@@ -49,6 +49,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     User/ring_buffer/ring_buffer.c
     User/user_uart/user_uart.c
     User/gm6020/gm6020_can.c
+    User/pid/pid.c
 )
 
 # Add include paths
@@ -58,6 +59,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     User/ring_buffer
     User/user_uart
     User/gm6020
+    User/pid
 )
 
 # Add project symbols (macros)

@@ -5,11 +5,11 @@
 #include "can.h"
 #include <string.h>
 #include "main.h"
+#include "pid.h"
 
 
 #define Voltage 0
 #define Current 1
-#define LIMIT_MIN_MAX(amt,low,high) ((amt)<(low)?(low):((amt)>(high)?(high):(amt)))
 #define MOTOR_MAX_RATED_SPEED       132     // 额定安全转速（无负载时）
 #define MOTOR_MAX_ELECTRICAL_SPEED  320     // 电气极限转速（带负载）
 #define MOTOR_DEFAULT_SPEED_LIMIT   200     // 推荐默认限速
@@ -66,27 +66,6 @@ typedef enum
 
 
 
-typedef struct
-{
-	float Kp, Ki,Kd;
-	float actual_val;
-	float target_val;
-	float err;
-	float err_last;
-	float err_sum;
-}pid;
-
-typedef struct
-{
-    pid outer;
-    pid inner;
-	float output;
-}pid_Cascade;
-
-
-
-typedef pid * pid_t;
-
 extern uint8_t TxData[8];
 extern uint8_t RxData[8];
 extern volatile Motor_Date motor_date[];
@@ -94,12 +73,6 @@ extern CAN_FilterTypeDef sFilterConfig;
 extern CAN_TxHeaderTypeDef TxMessage;
 extern CAN_RxHeaderTypeDef RxMessage;
 
-float shortest_path_error(float target, float current);
-float Pid_Speed(pid_t pid ,float actual_val,float target_val);
-float Pid_Position(pid_t pid ,float actual_val,float target_val);
-float GM6020_ST_Control(pid_Cascade*pid,float actual_val,float target_val,uint8_t ID);
-float GM6020_MT_Control(pid_Cascade*pid,float actual_val,float target_val,uint8_t ID);
-void Pid_Init(pid_t pid,float kp,float ki, float kd);
 void Configure_Filter(void);
 void CAN_Transmit(int16_t data1,int16_t data2,int16_t data3,int16_t data4,uint8_t mode);
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan);
