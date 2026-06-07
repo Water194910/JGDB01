@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include "gm6020_can.h"
 #include "pid.h"
+#include "bno085.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -536,6 +537,10 @@ int main(void)
   // 启动maixcam2串口DMA接收（IDLE空闲中断方式）
   HAL_UARTEx_ReceiveToIdle_DMA(&huart3, cam_rx_buf, CAM_RX_BUF_SIZE);
 
+  // 初始化BNO085 IMU（UART-SHTP模式）
+  BNO085_Init();
+  HAL_UART_Transmit(&huart1, (uint8_t *)"BNO085 IMU初始化完成\r\n", 21, 100);
+
   // 等待电机反馈数据稳定
   HAL_Delay(500);
 
@@ -583,6 +588,31 @@ int main(void)
           }
         }
         i++;
+      }
+    }
+
+    // 处理BNO085 DMA数据
+    if (bno085_frame_ready) {
+      bno085_frame_ready = 0;
+      BNO085_ProcessData(bno085_rx_buf, bno085_rx_len);
+    }
+
+    // 临时测试：每100ms打印一次IMU数据
+    static uint32_t last_imu_print = 0;
+    if (time_ms_ms - last_imu_print >= 100) {
+      last_imu_print = time_ms_ms;
+
+      char imu_buf[128];
+      int len = snprintf(imu_buf, sizeof(imu_buf),
+                         "IMU: yaw=%6.1f pitch=%6.1f roll=%6.1f gx=%6.2f gy=%6.2f gz=%6.2f\r\n",
+                         bno085_data.rotation.yaw,
+                         bno085_data.rotation.pitch,
+                         bno085_data.rotation.roll,
+                         bno085_data.gyro.x,
+                         bno085_data.gyro.y,
+                         bno085_data.gyro.z);
+      if (len > 0) {
+        HAL_UART_Transmit(&huart1, (uint8_t *)imu_buf, (uint16_t)len, 100);
       }
     }
 
@@ -773,7 +803,7 @@ void HAL_TIM3_PeriodElapsedCallback(void)
 }
 
 /**
- * @brief DMA空闲中断回调 - USART3接收到完整帧
+ * @brief DMA空闲中断回调 - USART2/USART3接收到完整帧
  */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
@@ -786,6 +816,16 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     }
     // 重新启动DMA接收
     HAL_UARTEx_ReceiveToIdle_DMA(&huart3, cam_rx_buf, CAM_RX_BUF_SIZE);
+  }
+  else if (huart->Instance == USART2)
+  {
+    if (Size > 0)
+    {
+      bno085_rx_len = Size;
+      bno085_frame_ready = 1;
+    }
+    // 重新启动DMA接收
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, bno085_rx_buf, 256);
   }
 }
 

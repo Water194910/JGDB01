@@ -14,11 +14,8 @@ typedef struct
     RingBufferTypeDef *recvBuf;
 } Usart_DataTypeDef;
 
-extern Usart_DataTypeDef FSUS_usart2;  // 舵机串口
 extern UART_HandleTypeDef huart1;       // 调试串口
 
-void User_Uart_Init(UART_HandleTypeDef *huartx);
-void Usart_SendAll(Usart_DataTypeDef *usart);
 void Debug_Printf(const char *fmt, ...);
 
 #endif

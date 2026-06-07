@@ -45,21 +45,21 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # User sources
-    User/fashion_star_uart_servo/fashion_star_uart_servo.c
     User/ring_buffer/ring_buffer.c
     User/user_uart/user_uart.c
     User/gm6020/gm6020_can.c
     User/pid/pid.c
+    User/bno085/bno085.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # User include paths
-    User/fashion_star_uart_servo
     User/ring_buffer
     User/user_uart
     User/gm6020
     User/pid
+    User/bno085
 )
 
 # Add project symbols (macros)

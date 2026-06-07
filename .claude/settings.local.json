@@ -4,7 +4,12 @@
       "Read(//c/Users/34292/.claude/**)",
       "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\34292\\\\.claude\" -Recurse -Filter \"*.md\" -ErrorAction SilentlyContinue)",
       "Bash(Select-Object FullName)",
-      "Read(//c/Users/34292/Desktop/bno/**)"
+      "Read(//c/Users/34292/Desktop/bno/**)",
+      "Bash(rm -rf \"c:\\\\Users\\\\34292\\\\Desktop\\\\yt\\\\User\\\\fashion_star_uart_servo\")",
+      "Bash(cmake --build .)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\34292\\Desktop\\yt\\User\\fashion_star_uart_servo"
     ]
   }
 }
