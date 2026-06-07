@@ -28,6 +28,13 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef enum {
+  GIMBAL_STATE_BOOT_HOLD = 0,  // 开机短暂保持
+  GIMBAL_STATE_SEARCH,         // 未找到目标，水平摆扫
+  GIMBAL_STATE_TRACK,          // 视觉追踪
+  GIMBAL_STATE_LOST_HOLD       // 目标短暂丢失，保持最后位置
+} GimbalState_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -67,6 +74,17 @@
 #define GIMBAL_IMU_ROLL_OFFSET_DEFAULT  0.0f    // Roll开机偏移（自动Tare）
 #define GIMBAL_USE_IMU_POS_DEFAULT     0       // Y轴位置环模式（0=编码器，1=IMU Roll）
 #define RADS_TO_DEGS           57.2957795f
+#define GIMBAL_BOOT_HOLD_MS     500U     // 开机保持时间，等待外设稳定
+#define GIMBAL_TRACK_TIMEOUT_MS 300U     // TRACK短暂丢帧保持时间
+#define GIMBAL_SEARCH_RANGE_DEG 60.0f    // 搜索时相对开机点左右摆扫范围
+#define GIMBAL_SEARCH_STEP_DEG  0.35f    // 搜索时每10ms目标角增量
+
+// GM6020轴映射：motor_date[ID-1]，CAN_Transmit第1~4路分别对应ID1~ID4
+#define GIMBAL_X_MOTOR_ID       2       // 水平方向/Yaw：GM6020 ID2
+#define GIMBAL_Y_MOTOR_ID       1       // 俯仰方向/Roll：GM6020 ID1
+#define GIMBAL_X_MOTOR_INDEX    (GIMBAL_X_MOTOR_ID - 1)
+#define GIMBAL_Y_MOTOR_INDEX    (GIMBAL_Y_MOTOR_ID - 1)
+
 // 串口调参缓冲区
 // Flash参数存储
 #define FLASH_SAVE_ADDR         0x08060000   // Sector7起始地址
@@ -149,6 +167,7 @@ int16_t cam_dy = 0;
 volatile uint8_t cam_connected = 0;
 volatile uint32_t cam_rx_count = 0;     // 接收次数计数
 volatile uint32_t cam_parse_ok = 0;     // 解析成功次数
+volatile uint32_t cam_last_track_ms = 0; // 最近一次识别到目标的时间
 
 // 云台状态
 float gimbal_x_angle = 0.0f;    // X轴当前角度
@@ -157,6 +176,10 @@ float gimbal_x_target = 0.0f;   // X轴目标角度
 float gimbal_y_target = 0.0f;   // Y轴目标角度
 float gimbal_x_speed_target = 0.0f;  // 位置环输出的目标速度
 float gimbal_y_speed_target = 0.0f;  // 位置环输出的目标速度
+float gimbal_search_center = 0.0f;    // 搜索摆扫中心
+int8_t gimbal_search_dir = 1;         // 搜索方向
+uint32_t gimbal_boot_ready_ms = 0;    // 允许开始搜索的时间
+GimbalState_t gimbal_state = GIMBAL_STATE_BOOT_HOLD;
 
 /* USER CODE END PV */
 
@@ -165,6 +188,8 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void Gimbal_ProcessCamData(void);
 void HAL_TIM3_PeriodElapsedCallback(void);
+void Gimbal_CANTransmitAxes(int16_t x_voltage, int16_t y_voltage);
+void Gimbal_UpdateStateAndSearch(void);
 void Debug_ParseCommand(uint8_t *cmd, uint16_t len);
 void Debug_PrintParams(void);
 void FlashParams_Save(void);
@@ -644,10 +669,14 @@ int main(void)
   HAL_Delay(500);
 
   // 不归零，保持电机当前位置
-  gimbal_x_target = motor_date[0].total_du;
-  gimbal_x_angle = motor_date[0].total_du;
-  gimbal_y_target = motor_date[1].total_du;
-  gimbal_y_angle = motor_date[1].total_du;
+  gimbal_x_target = motor_date[GIMBAL_X_MOTOR_INDEX].total_du;
+  gimbal_x_angle = motor_date[GIMBAL_X_MOTOR_INDEX].total_du;
+  gimbal_y_target = motor_date[GIMBAL_Y_MOTOR_INDEX].total_du;
+  gimbal_y_angle = motor_date[GIMBAL_Y_MOTOR_INDEX].total_du;
+  gimbal_search_center = gimbal_x_target;
+  gimbal_search_dir = 1;
+  gimbal_boot_ready_ms = time_ms_ms + GIMBAL_BOOT_HOLD_MS;
+  gimbal_state = GIMBAL_STATE_BOOT_HOLD;
 
   HAL_UART_Transmit(&huart1, (uint8_t *)"GM6020 X/Y保持当前位置\r\n", strlen("GM6020 X/Y保持当前位置\r\n"), 100);
 
@@ -680,6 +709,9 @@ int main(void)
             cam_dy = (int16_t)(cam_rx_buf[i+5] | (cam_rx_buf[i+6] << 8));
             cam_connected = 1;
             cam_parse_ok++;
+            if (cam_cmd == CAM_CMD_TRACK) {
+              cam_last_track_ms = time_ms_ms;
+            }
 
             // 处理视觉数据，更新目标
             Gimbal_ProcessCamData();
@@ -774,7 +806,7 @@ void SystemClock_Config(void)
 void Gimbal_ProcessCamData(void)
 {
   if (cam_cmd == CAM_CMD_TRACK) {
-    float pos_err = fabsf(gimbal_x_target - motor_date[0].total_du);
+    float pos_err = fabsf(gimbal_x_target - motor_date[GIMBAL_X_MOTOR_INDEX].total_du);
     float cam_dx_abs = (float)abs(cam_dx);
     uint8_t in_boost = (cam_dx_abs > gimbal_boost_px_threshold) ? 1 : 0;
 
@@ -819,6 +851,80 @@ void Gimbal_ProcessCamData(void)
       if (gimbal_y_target > GIMBAL_Y_MAX) gimbal_y_target = GIMBAL_Y_MAX;
       if (gimbal_y_target < GIMBAL_Y_MIN) gimbal_y_target = GIMBAL_Y_MIN;
     }
+  } else {
+    gimbal_x_boost_active = 0;
+  }
+}
+
+/**
+ * @brief 根据轴到电机ID映射发送GM6020控制量
+ */
+void Gimbal_CANTransmitAxes(int16_t x_voltage, int16_t y_voltage)
+{
+  int16_t can_data[4] = {0, 0, 0, 0};
+
+  can_data[GIMBAL_X_MOTOR_INDEX] = x_voltage;
+  can_data[GIMBAL_Y_MOTOR_INDEX] = y_voltage;
+
+  CAN_Transmit(can_data[0], can_data[1], can_data[2], can_data[3], Voltage);
+}
+
+/**
+ * @brief 更新云台搜索/追踪状态，未锁定目标时执行水平摆扫
+ */
+void Gimbal_UpdateStateAndSearch(void)
+{
+  uint8_t target_valid = (cam_connected &&
+                          cam_cmd == CAM_CMD_TRACK &&
+                          (time_ms_ms - cam_last_track_ms) <= GIMBAL_TRACK_TIMEOUT_MS);
+
+  if (target_valid) {
+    if (gimbal_state != GIMBAL_STATE_TRACK) {
+      gimbal_search_center = gimbal_x_target;
+      pid_x_pos.err_sum = 0.0f;
+      gimbal_x_boost_active = 0;
+    }
+    gimbal_state = GIMBAL_STATE_TRACK;
+    return;
+  }
+
+  if (gimbal_state == GIMBAL_STATE_TRACK) {
+    gimbal_state = GIMBAL_STATE_LOST_HOLD;
+    return;
+  }
+
+  if (gimbal_state == GIMBAL_STATE_LOST_HOLD) {
+    if ((time_ms_ms - cam_last_track_ms) <= GIMBAL_TRACK_TIMEOUT_MS) {
+      return;
+    }
+    gimbal_search_center = gimbal_x_angle;
+    gimbal_search_dir = 1;
+    pid_x_pos.err_sum = 0.0f;
+    gimbal_x_boost_active = 0;
+    gimbal_state = GIMBAL_STATE_SEARCH;
+  }
+
+  if (gimbal_state == GIMBAL_STATE_BOOT_HOLD) {
+    if (time_ms_ms < gimbal_boot_ready_ms) {
+      return;
+    }
+    gimbal_search_center = gimbal_x_angle;
+    gimbal_search_dir = 1;
+    pid_x_pos.err_sum = 0.0f;
+    gimbal_x_boost_active = 0;
+    gimbal_state = GIMBAL_STATE_SEARCH;
+  }
+
+  if (gimbal_state == GIMBAL_STATE_SEARCH) {
+    gimbal_x_target += (float)gimbal_search_dir * GIMBAL_SEARCH_STEP_DEG;
+
+    if (gimbal_x_target > gimbal_search_center + GIMBAL_SEARCH_RANGE_DEG) {
+      gimbal_x_target = gimbal_search_center + GIMBAL_SEARCH_RANGE_DEG;
+      gimbal_search_dir = -1;
+    } else if (gimbal_x_target < gimbal_search_center - GIMBAL_SEARCH_RANGE_DEG) {
+      gimbal_x_target = gimbal_search_center - GIMBAL_SEARCH_RANGE_DEG;
+      gimbal_search_dir = 1;
+    }
   }
 }
 
@@ -841,7 +947,7 @@ void Gimbal_SetImuYMode(uint8_t enable)
     gimbal_imu_roll_offset = bno085_data.rotation.roll;
     gimbal_y_target = 0.0f;
   } else {
-    gimbal_y_target = motor_date[1].total_du;
+    gimbal_y_target = motor_date[GIMBAL_Y_MOTOR_INDEX].total_du;
   }
 
   gimbal_use_imu_pos = enable;
@@ -869,10 +975,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
       float x_speed_target_rpm = x_speed_cmd_dps / RPM_TO_DEGS;
       float y_speed_target_rpm = y_speed_cmd_dps / RPM_TO_DEGS;
       int16_t x_voltage = (int16_t)PID_SpeedLoop(&pid_x_speed,
-                                                  (float)motor_date[0].rotor_speed,
+                                                  (float)motor_date[GIMBAL_X_MOTOR_INDEX].rotor_speed,
                                                   x_speed_target_rpm);
       int16_t y_voltage = (int16_t)PID_SpeedLoop(&pid_y_speed,
-                                                  (float)motor_date[1].rotor_speed,
+                                                  (float)motor_date[GIMBAL_Y_MOTOR_INDEX].rotor_speed,
                                                   y_speed_target_rpm);
 
       // 限幅
@@ -881,7 +987,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
       if (y_voltage > 25000) y_voltage = 25000;
       if (y_voltage < -25000) y_voltage = -25000;
 
-      CAN_Transmit(x_voltage, y_voltage, 0, 0, Voltage);
+      Gimbal_CANTransmitAxes(x_voltage, y_voltage);
     }
 
     // 位置环：每10ms执行一次
@@ -893,9 +999,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         pid_last_boost = gimbal_x_boost_active;
       }
 
+      Gimbal_UpdateStateAndSearch();
+
       // X轴无限旋转，始终使用GM6020编码器多圈角度闭环。
       gimbal_x_speed_target = PID_PositionLoop(&pid_x_pos,
-                                                motor_date[0].total_du,
+                                                motor_date[GIMBAL_X_MOTOR_INDEX].total_du,
                                                 gimbal_x_target);
 
       // Y轴可选择编码器角度或IMU Roll姿态外环。
@@ -907,7 +1015,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                                                         gimbal_y_target);
       } else {
         gimbal_y_speed_target = PID_PositionLoop(&pid_y_pos,
-                                                  motor_date[1].total_du,
+                                                  motor_date[GIMBAL_Y_MOTOR_INDEX].total_du,
                                                   gimbal_y_target);
       }
       // boost：像素偏移大时加速追赶（仅追踪模式）
@@ -919,8 +1027,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
       }
 
       // 更新当前角度
-      gimbal_x_angle = motor_date[0].total_du;
-      gimbal_y_angle = motor_date[1].total_du;
+      gimbal_x_angle = motor_date[GIMBAL_X_MOTOR_INDEX].total_du;
+      gimbal_y_angle = motor_date[GIMBAL_Y_MOTOR_INDEX].total_du;
 
       time_ms = 0;
     }
