@@ -31,6 +31,7 @@ typedef struct
 void PID_Init(PID_Handle_t pid, float kp, float ki, float kd);
 float PID_SpeedLoop(PID_Handle_t pid, float actual_val, float target_val);
 float PID_PositionLoop(PID_Handle_t pid, float actual_val, float target_val);
+float PID_PositionLoop_Angle(PID_Handle_t pid, float actual_val, float target_val);
 float ShortestPath_Error(float target, float current);
 
 #endif

@@ -54,3 +54,18 @@ float ShortestPath_Error(float target, float current)
 
     return error;
 }
+
+float PID_PositionLoop_Angle(PID_Handle_t pid, float actual_val, float target_val)
+{
+    pid->target_val = target_val;
+    pid->actual_val = actual_val;
+    pid->err = ShortestPath_Error(target_val, actual_val);  // 使用最短路径误差
+    pid->err_sum += pid->err;
+
+    float err_out = pid->Kp * pid->err
+                  + pid->Ki * pid->err_sum
+                  + pid->Kd * (pid->err - pid->err_last);
+    pid->err_last = pid->err;
+
+    return PID_LIMIT_MIN_MAX(err_out, -PID_SPEED_MAX_DEG, PID_SPEED_MAX_DEG);
+}

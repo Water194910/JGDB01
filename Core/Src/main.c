@@ -62,11 +62,16 @@
 #define GIMBAL_X_MAX            540.0f   // X轴最大角度（1.5圈）
 #define GIMBAL_Y_MAX            20.0f    // Y轴最大角度
 #define GIMBAL_Y_MIN            -20.0f   // Y轴最小角度
+#define GIMBAL_K_GYRO_DEFAULT   0.5f     // IMU阻尼系数
+#define GIMBAL_IMU_YAW_OFFSET_DEFAULT   0.0f    // Yaw开机偏移（自动Tare）
+#define GIMBAL_IMU_ROLL_OFFSET_DEFAULT  0.0f    // Roll开机偏移（自动Tare）
+#define GIMBAL_USE_IMU_POS_DEFAULT     0       // Y轴位置环模式（0=编码器，1=IMU Roll）
+#define RADS_TO_DEGS           57.2957795f
 // 串口调参缓冲区
 // Flash参数存储
 #define FLASH_SAVE_ADDR         0x08060000   // Sector7起始地址
 #define FLASH_SAVE_MAGIC        0x594E494C   // "LINY" 灵犀的校验头
-#define FLASH_SAVE_VERSION      4
+#define FLASH_SAVE_VERSION      6
 
 typedef struct {
   uint32_t magic;
@@ -79,6 +84,10 @@ typedef struct {
   float boost_px_threshold;
   float x_delta_max_boost;
   float poserr_guard_boost;
+  float k_gyro;               // IMU阻尼系数
+  float imu_yaw_offset;       // Yaw开机偏移
+  float imu_roll_offset;      // Roll开机偏移
+  uint8_t use_imu_pos;        // Y轴位置环模式（0=编码器，1=IMU Roll）
   uint32_t crc;
 } FlashParams;
 
@@ -123,6 +132,10 @@ float gimbal_boost_max = GIMBAL_BOOST_MAX;
 float gimbal_boost_px_threshold = GIMBAL_BOOST_PX_THRESHOLD;
 float gimbal_x_delta_max_boost = GIMBAL_X_DELTA_MAX_BOOST;
 float gimbal_poserr_guard_boost = GIMBAL_POSERR_GUARD_BOOST;
+float gimbal_k_gyro = GIMBAL_K_GYRO_DEFAULT;  // IMU阻尼系数
+float gimbal_imu_yaw_offset = GIMBAL_IMU_YAW_OFFSET_DEFAULT;   // Yaw偏移（仅用于观测/调试）
+float gimbal_imu_roll_offset = GIMBAL_IMU_ROLL_OFFSET_DEFAULT;  // Roll偏移（Y轴IMU外环零点）
+uint8_t gimbal_use_imu_pos = GIMBAL_USE_IMU_POS_DEFAULT;       // Y轴位置环模式（0=编码器，1=IMU Roll）
 volatile uint8_t gimbal_x_boost_active = 0;   // boost状态标志(主循环→ISR)
 
 // maixcam2 DMA接收
@@ -156,6 +169,7 @@ void Debug_ParseCommand(uint8_t *cmd, uint16_t len);
 void Debug_PrintParams(void);
 void FlashParams_Save(void);
 void FlashParams_Load(void);
+void Gimbal_SetImuYMode(uint8_t enable);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -175,6 +189,32 @@ static uint32_t Flash_CRC32(const uint8_t *data, uint32_t len)
     }
   }
   return ~crc;
+}
+
+/**
+ * @brief 处理一帧BNO085 DMA接收数据
+ */
+static void BNO085_ServiceRx(void)
+{
+  BNO085_Service();
+}
+
+/**
+ * @brief 等待BNO085输出首帧有效姿态数据
+ */
+static uint8_t BNO085_WaitForFirstData(uint32_t timeout_ms)
+{
+  uint32_t start = HAL_GetTick();
+
+  while ((HAL_GetTick() - start) < timeout_ms) {
+    BNO085_ServiceRx();
+    if (bno085_data.data_ready) {
+      return 1;
+    }
+    HAL_Delay(1);
+  }
+
+  return 0;
 }
 
 /**
@@ -202,6 +242,10 @@ void FlashParams_Save(void)
   params.boost_px_threshold = gimbal_boost_px_threshold;
   params.x_delta_max_boost = gimbal_x_delta_max_boost;
   params.poserr_guard_boost = gimbal_poserr_guard_boost;
+  params.k_gyro = gimbal_k_gyro;
+  params.imu_yaw_offset = gimbal_imu_yaw_offset;
+  params.imu_roll_offset = gimbal_imu_roll_offset;
+  params.use_imu_pos = gimbal_use_imu_pos;
   // 计算CRC（不含crc字段本身）
   params.crc = Flash_CRC32((uint8_t *)&params, sizeof(params) - 4);
 
@@ -271,6 +315,11 @@ void FlashParams_Load(void)
   gimbal_boost_px_threshold = params->boost_px_threshold;
   gimbal_x_delta_max_boost = params->x_delta_max_boost;
   gimbal_poserr_guard_boost = params->poserr_guard_boost;
+  gimbal_k_gyro = params->k_gyro;
+  gimbal_imu_yaw_offset = params->imu_yaw_offset;
+  gimbal_imu_roll_offset = params->imu_roll_offset;
+  // 开机始终先用编码器搜索目标，避免IMU相对零点和编码器多圈目标混用。
+  gimbal_use_imu_pos = GIMBAL_USE_IMU_POS_DEFAULT;
 
   HAL_UART_Transmit(&huart1, (uint8_t *)"已从Flash加载参数 ✓\r\n", 20, 100);
 }
@@ -319,11 +368,12 @@ static void ftoa(float val, char *out, int decimals)
  */
 void Debug_PrintParams(void)
 {
-  char buf[360];
+  char buf[500];
   char xkp[12], xki[12], xkd[12];
   char xsp[12], xsi[12], xsd[12];
   char ykp[12], yki[12], ykd[12], ytp[12];
   char bt[12], bg[12], bm[12], bp[12], bd[12], be[12];
+  char kg[12], io[12], ir[12];
 
   ftoa(gimbal_x_kp, xkp, 3);
   ftoa(gimbal_x_ki, xki, 3);
@@ -341,6 +391,9 @@ void Debug_PrintParams(void)
   ftoa(gimbal_boost_px_threshold, bp, 1);
   ftoa(gimbal_x_delta_max_boost, bd, 3);
   ftoa(gimbal_poserr_guard_boost, be, 3);
+  ftoa(gimbal_k_gyro, kg, 3);
+  ftoa(gimbal_imu_yaw_offset, io, 3);
+  ftoa(gimbal_imu_roll_offset, ir, 3);
 
   int len = snprintf(buf, sizeof(buf),
                      "\r\n=== 当前参数 ===\r\n"
@@ -349,9 +402,10 @@ void Debug_PrintParams(void)
                      "Y位置: KP=%s KI=%s KD=%s\r\n"
                      "Y目标比例: KP=%s\r\n"
                      "Boost: BT=%s BG=%s BM=%s BP=%s BD=%s BE=%s\r\n"
+                     "IMU: KG=%s IO=%s IR=%s IU(Y)=%d\r\n"
                      "================\r\n",
                      xkp, xki, xkd, xsp, xsi, xsd, ykp, yki, ykd, ytp,
-                     bt, bg, bm, bp, bd, be);
+                     bt, bg, bm, bp, bd, be, kg, io, ir, gimbal_use_imu_pos);
   if (len > 0) {
     if (len > (int)sizeof(buf)) {
       len = sizeof(buf);
@@ -437,6 +491,30 @@ void Debug_ParseCommand(uint8_t *cmd, uint16_t len)
       case 'e': case 'E': gimbal_poserr_guard_boost = value; updated_pid = 1; break;
       default: break;
     }
+  } else if ((cmd[0] == 'K' || cmd[0] == 'k') && len >= 3) {
+    if (cmd[1] == 'G' || cmd[1] == 'g') {
+      value = atof((char *)&cmd[2]);
+      gimbal_k_gyro = value;
+      updated_pid = 1;
+    }
+  } else if ((cmd[0] == 'I' || cmd[0] == 'i') && len >= 3) {
+    switch (cmd[1]) {
+      case 'o': case 'O':  // Yaw偏移
+        value = atof((char *)&cmd[2]);
+        gimbal_imu_yaw_offset = value;
+        updated_pid = 1;
+        break;
+      case 'r': case 'R':  // Roll偏移
+        value = atof((char *)&cmd[2]);
+        gimbal_imu_roll_offset = value;
+        updated_pid = 1;
+        break;
+      case 'u': case 'U':  // Y轴使用IMU Roll位置环
+        value = atof((char *)&cmd[2]);
+        Gimbal_SetImuYMode((uint8_t)value);
+        updated_pid = 1;
+        break;
+    }
   }
 
   if (updated_pid) {
@@ -489,6 +567,7 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
   MX_USART3_UART_Init();
   MX_TIM2_Init();
   MX_CAN1_Init();
@@ -526,6 +605,10 @@ int main(void)
   HAL_UART_Transmit(&huart1, (uint8_t *)"BP120  - boost像素阈值\r\n", 21, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"BD25   - boost时x_delta上限(°)\r\n", 30, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"BE180  - boost时pos_err门限(°)\r\n", 30, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"KG0.5  - IMU阻尼系数\r\n", 21, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"IO0.0  - Yaw开机偏移(自动Tare)\r\n", 31, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"IR0.0  - Roll开机偏移(自动Tare)\r\n", 32, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"IU0    - Y轴位置环(0=编码器,1=IMU Roll)\r\n", 42, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"PID    - 查询参数\r\n", 19, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"SAVE   - 保存参数到Flash\r\n", 23, 100);
   HAL_UART_Transmit(&huart1, (uint8_t *)"====================\r\n\r\n", 25, 100);
@@ -540,6 +623,22 @@ int main(void)
   // 初始化BNO085 IMU（UART-SHTP模式）
   BNO085_Init();
   HAL_UART_Transmit(&huart1, (uint8_t *)"BNO085 IMU初始化完成\r\n", 21, 100);
+
+  // 开机自动Tare：记录当前IMU姿态作为零点
+  if (!BNO085_WaitForFirstData(300)) {
+    HAL_UART_Transmit(&huart1, (uint8_t *)"BNO085首帧等待超时\r\n", strlen("BNO085首帧等待超时\r\n"), 100);
+  }
+  gimbal_imu_yaw_offset = bno085_data.rotation.yaw;
+  gimbal_imu_roll_offset = bno085_data.rotation.roll;
+  {
+    char tare_buf[64];
+    int tare_len = snprintf(tare_buf, sizeof(tare_buf),
+                            "IMU Tare: Yaw=%.1f Roll=%.1f\r\n",
+                            gimbal_imu_yaw_offset, gimbal_imu_roll_offset);
+    if (tare_len > 0) {
+      HAL_UART_Transmit(&huart1, (uint8_t *)tare_buf, (uint16_t)tare_len, 100);
+    }
+  }
 
   // 等待电机反馈数据稳定
   HAL_Delay(500);
@@ -592,10 +691,7 @@ int main(void)
     }
 
     // 处理BNO085 DMA数据
-    if (bno085_frame_ready) {
-      bno085_frame_ready = 0;
-      BNO085_ProcessData(bno085_rx_buf, bno085_rx_len);
-    }
+    BNO085_ServiceRx();
 
     // 临时测试：每100ms打印一次IMU数据
     static uint32_t last_imu_print = 0;
@@ -726,6 +822,31 @@ void Gimbal_ProcessCamData(void)
   }
 }
 
+/**
+ * @brief 切换Y轴位置环反馈来源，切换时重建目标坐标避免冲击
+ */
+void Gimbal_SetImuYMode(uint8_t enable)
+{
+  enable = enable ? 1U : 0U;
+
+  if (enable == gimbal_use_imu_pos) {
+    return;
+  }
+
+  pid_y_pos.err_sum = 0.0f;
+  pid_y_pos.err_last = 0.0f;
+  gimbal_y_speed_target = 0.0f;
+
+  if (enable) {
+    gimbal_imu_roll_offset = bno085_data.rotation.roll;
+    gimbal_y_target = 0.0f;
+  } else {
+    gimbal_y_target = motor_date[1].total_du;
+  }
+
+  gimbal_use_imu_pos = enable;
+}
+
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -737,9 +858,16 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
     // 速度环：每2ms执行一次
     if (time_ms % 2 == 0) {
+      // IMU阻尼项（在速度环目标上叠加）
+      // BNO085角速度单位为rad/s，位置环输出单位为deg/s。
+      float x_damping_dps = gimbal_k_gyro * bno085_data.gyro.z * RADS_TO_DEGS;
+      float y_damping_dps = gimbal_k_gyro * bno085_data.gyro.x * RADS_TO_DEGS;
+      float x_speed_cmd_dps = gimbal_x_speed_target - x_damping_dps;
+      float y_speed_cmd_dps = gimbal_y_speed_target - y_damping_dps;
+
       // 速度环使用RPM单位，与参考工程保持一致
-      float x_speed_target_rpm = gimbal_x_speed_target / RPM_TO_DEGS;
-      float y_speed_target_rpm = gimbal_y_speed_target / RPM_TO_DEGS;
+      float x_speed_target_rpm = x_speed_cmd_dps / RPM_TO_DEGS;
+      float y_speed_target_rpm = y_speed_cmd_dps / RPM_TO_DEGS;
       int16_t x_voltage = (int16_t)PID_SpeedLoop(&pid_x_speed,
                                                   (float)motor_date[0].rotor_speed,
                                                   x_speed_target_rpm);
@@ -765,13 +893,23 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         pid_last_boost = gimbal_x_boost_active;
       }
 
-      // 正常模式：位置环根据角度偏差计算目标转速（deg/s）
+      // X轴无限旋转，始终使用GM6020编码器多圈角度闭环。
       gimbal_x_speed_target = PID_PositionLoop(&pid_x_pos,
                                                 motor_date[0].total_du,
                                                 gimbal_x_target);
-      gimbal_y_speed_target = PID_PositionLoop(&pid_y_pos,
-                                                motor_date[1].total_du,
-                                                gimbal_y_target);
+
+      // Y轴可选择编码器角度或IMU Roll姿态外环。
+      if (gimbal_use_imu_pos) {
+        float imu_roll_relative = ShortestPath_Error(bno085_data.rotation.roll,
+                                                     gimbal_imu_roll_offset);
+        gimbal_y_speed_target = PID_PositionLoop_Angle(&pid_y_pos,
+                                                        imu_roll_relative,
+                                                        gimbal_y_target);
+      } else {
+        gimbal_y_speed_target = PID_PositionLoop(&pid_y_pos,
+                                                  motor_date[1].total_du,
+                                                  gimbal_y_target);
+      }
       // boost：像素偏移大时加速追赶（仅追踪模式）
       float cam_dx_abs = (float)(abs(cam_dx));
       if (cam_cmd == CAM_CMD_TRACK && cam_dx_abs > gimbal_boost_px_threshold) {
@@ -822,7 +960,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     if (Size > 0)
     {
       bno085_rx_len = Size;
-      bno085_frame_ready = 1;
+      BNO085_PushRxData(bno085_rx_buf, Size);
     }
     // 重新启动DMA接收
     HAL_UARTEx_ReceiveToIdle_DMA(&huart2, bno085_rx_buf, 256);

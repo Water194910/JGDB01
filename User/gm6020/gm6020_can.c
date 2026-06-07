@@ -125,10 +125,11 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
             motor_date[MotorID].torque_current    = ((aData[4] << 8) | aData[5]);
             motor_date[MotorID].motor_temperature =   aData[6];
 			int16_t delta = motor_date[MotorID].rotor_angle - motor_date[MotorID].rotor_last_angle;  //多圈计数逻辑
-			 if(delta > 4096)
-            motor_date[MotorID].turn_count--;
-            else if(delta < -4096)
-            motor_date[MotorID].turn_count++;
+            if (delta > 4096) {
+                motor_date[MotorID].turn_count--;
+            } else if (delta < -4096) {
+                motor_date[MotorID].turn_count++;
+            }
 
 			motor_date[MotorID].total_ticks= motor_date[MotorID].turn_count*8192+motor_date[MotorID].rotor_angle;//多圈总角度
 			motor_date[MotorID].total_rad  =  motor_date[MotorID].total_ticks*RAD_PER_TICK;

@@ -1,7 +1,11 @@
 #include "bno085.h"
+#include "ring_buffer.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+
+#define BNO085_RING_CAPACITY 1024
+#define BNO085_PACKET_MAX    256
 
 // BNO085数据
 BNO085_Data_t bno085_data = {0};
@@ -11,6 +15,13 @@ uint8_t bno085_rx_buf[256];
 volatile uint16_t bno085_rx_len = 0;
 volatile uint8_t bno085_frame_ready = 0;
 
+static uint8_t bno085_ring_storage[BNO085_RING_CAPACITY + 1];
+static RingBufferTypeDef bno085_ring;
+static uint8_t bno085_packet_buf[BNO085_PACKET_MAX];
+static volatile uint8_t bno085_ring_inited = 0;
+static volatile uint32_t bno085_rx_overflow_count = 0;
+static volatile uint32_t bno085_bad_packet_count = 0;
+
 // SHTP序列号
 static uint8_t shtp_sequence[6] = {0}; // 6个通道的序列号
 
@@ -19,7 +30,7 @@ static uint8_t shtp_sequence[6] = {0}; // 6个通道的序列号
  */
 static void BNO085_ParseSHTPHeader(uint8_t *data, SHTP_Header_t *header)
 {
-    header->length = (uint16_t)(data[0] | (data[1] << 8));
+    header->length = (uint16_t)(data[0] | ((data[1] & 0x7F) << 8));
     header->continuation = (data[1] >> 7) & 0x01;
     header->channel = data[2];
     header->sequence = data[3];
@@ -221,6 +232,55 @@ void BNO085_ProcessData(uint8_t *data, uint16_t len)
 }
 
 /**
+ * @brief 将USART2 DMA收到的数据追加到BNO085环形缓冲区
+ */
+void BNO085_PushRxData(uint8_t *data, uint16_t len)
+{
+    if (!bno085_ring_inited || data == NULL || len == 0) {
+        return;
+    }
+
+    for (uint16_t i = 0; i < len; i++) {
+        if (RingBuffer_IsFull(&bno085_ring)) {
+            (void)RingBuffer_ReadByte(&bno085_ring);
+            bno085_rx_overflow_count++;
+        }
+        RingBuffer_WriteByte(&bno085_ring, data[i]);
+    }
+}
+
+/**
+ * @brief 从环形缓冲区按SHTP length拆出完整包并解析
+ */
+void BNO085_Service(void)
+{
+    if (!bno085_ring_inited) {
+        return;
+    }
+
+    while (RingBuffer_GetByteUsed(&bno085_ring) >= 4U) {
+        uint8_t len_l = RingBuffer_PeekByte(&bno085_ring, 0);
+        uint8_t len_h = RingBuffer_PeekByte(&bno085_ring, 1);
+        uint8_t channel = RingBuffer_PeekByte(&bno085_ring, 2);
+        uint16_t packet_len = (uint16_t)(len_l | ((len_h & 0x7FU) << 8));
+
+        // 长度或通道异常时丢1字节重新同步，避免错位后永久卡住。
+        if (packet_len < 4U || packet_len > BNO085_PACKET_MAX || channel > SHTP_CHANNEL_GYRO_ROTATION) {
+            (void)RingBuffer_ReadByte(&bno085_ring);
+            bno085_bad_packet_count++;
+            continue;
+        }
+
+        if (RingBuffer_GetByteUsed(&bno085_ring) < packet_len) {
+            break;
+        }
+
+        RingBuffer_ReadByteArray(&bno085_ring, bno085_packet_buf, packet_len);
+        BNO085_ProcessData(bno085_packet_buf, packet_len);
+    }
+}
+
+/**
  * @brief 将四元数转换为欧拉角（度）
  */
 void BNO085_ConvertToEuler(RotationVector_t *rv)
@@ -253,9 +313,18 @@ void BNO085_Init(void)
 {
     // 清空数据
     memset(&bno085_data, 0, sizeof(BNO085_Data_t));
+    bno085_rx_len = 0;
+    bno085_frame_ready = 0;
+    RingBuffer_Init(&bno085_ring, BNO085_RING_CAPACITY, bno085_ring_storage);
+    bno085_ring_inited = 1;
+    bno085_rx_overflow_count = 0;
+    bno085_bad_packet_count = 0;
 
     // 等待BNO085启动（H_INTN拉低表示就绪）
     HAL_Delay(100);
+
+    // 先启动USART2 DMA接收，避免初始化阶段响应包丢失。
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, bno085_rx_buf, 256);
 
     // 发送Product ID请求验证通信
     BNO085_SendProductIDRequest();
@@ -268,7 +337,4 @@ void BNO085_Init(void)
     // 使能校准陀螺仪（10ms间隔 = 100Hz）
     BNO085_EnableGyroCalibrated(10);
     HAL_Delay(10);
-
-    // 启动USART2 DMA接收
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, bno085_rx_buf, 256);
 }

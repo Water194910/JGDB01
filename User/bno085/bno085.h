@@ -58,6 +58,8 @@ typedef struct {
 // 函数声明
 void BNO085_Init(void);
 void BNO085_ProcessData(uint8_t *data, uint16_t len);
+void BNO085_PushRxData(uint8_t *data, uint16_t len);
+void BNO085_Service(void);
 void BNO085_SendProductIDRequest(void);
 void BNO085_EnableRotationVector(uint16_t interval_ms);
 void BNO085_EnableGyroCalibrated(uint16_t interval_ms);
