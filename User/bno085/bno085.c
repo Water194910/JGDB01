@@ -1,66 +1,121 @@
 #include "bno085.h"
-#include "ring_buffer.h"
 #include <math.h>
 #include <string.h>
-#include <stdio.h>
 
-#define BNO085_RING_CAPACITY 1024
-#define BNO085_PACKET_MAX    256
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+#define BNO085_DMA_BUF_SIZE 512
+#define BNO085_UART_FRAME_MAX 512
+
+#define UART_FLAG_BYTE      0x7E
+#define UART_ESCAPE_BYTE    0x7D
+#define UART_ESCAPE_XOR     0x20
+#define UART_PROTO_BSQ_BSN  0x00
+#define UART_PROTO_SHTP     0x01
+
+#define REPORT_ID_GAME_ROTATION_VECTOR 0x08
+
+#define BNO085_STATE_WAIT_RESET  0
+#define BNO085_STATE_READY       1
+#define BNO085_STATE_CONFIGURING 2
+#define BNO085_STATE_RUNNING     3
 
 // BNO085数据
 BNO085_Data_t bno085_data = {0};
 
 // USART2 DMA接收缓冲区
-uint8_t bno085_rx_buf[256];
+uint8_t bno085_rx_buf[BNO085_DMA_BUF_SIZE];
 volatile uint16_t bno085_rx_len = 0;
 volatile uint8_t bno085_frame_ready = 0;
 
-static uint8_t bno085_ring_storage[BNO085_RING_CAPACITY + 1];
-static RingBufferTypeDef bno085_ring;
-static uint8_t bno085_packet_buf[BNO085_PACKET_MAX];
-static volatile uint8_t bno085_ring_inited = 0;
-static volatile uint32_t bno085_rx_overflow_count = 0;
-static volatile uint32_t bno085_bad_packet_count = 0;
+static uint8_t uart_frame[BNO085_UART_FRAME_MAX];
+static uint16_t uart_frame_len;
+static uint8_t uart_in_frame;
+static uint8_t uart_escape;
+static uint8_t shtp_sequence[6];
+static uint16_t bno085_last_read_pos;
+static uint32_t bno085_last_bsq_ms;
+static uint8_t bno085_reports_enabled;
 
-// SHTP序列号
-static uint8_t shtp_sequence[6] = {0}; // 6个通道的序列号
-
-/**
- * @brief 解析SHTP头
- */
-static void BNO085_ParseSHTPHeader(uint8_t *data, SHTP_Header_t *header)
+static uint8_t BNO085_DmaRead(uint16_t pos)
 {
-    header->length = (uint16_t)(data[0] | ((data[1] & 0x7F) << 8));
-    header->continuation = (data[1] >> 7) & 0x01;
-    header->channel = data[2];
-    header->sequence = data[3];
+    return bno085_rx_buf[pos % BNO085_DMA_BUF_SIZE];
+}
+
+static int16_t BNO085_ReadI16(const uint8_t *p)
+{
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static void BNO085_DelayUs(uint32_t us)
+{
+    uint32_t cycles_per_us;
+    uint32_t cycles;
+    uint32_t start;
+
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    cycles_per_us = HAL_RCC_GetHCLKFreq() / 1000000u;
+    cycles = cycles_per_us * us;
+    start = DWT->CYCCNT;
+    while ((uint32_t)(DWT->CYCCNT - start) < cycles) {
+        __NOP();
+    }
+}
+
+static void BNO085_SendByte(uint8_t b)
+{
+    (void)HAL_UART_Transmit(&huart2, &b, 1, 10);
+    BNO085_DelayUs(120);
+}
+
+static void BNO085_SendEscaped(uint8_t b)
+{
+    if (b == UART_FLAG_BYTE || b == UART_ESCAPE_BYTE) {
+        BNO085_SendByte(UART_ESCAPE_BYTE);
+        BNO085_SendByte((uint8_t)(b ^ UART_ESCAPE_XOR));
+    } else {
+        BNO085_SendByte(b);
+    }
+}
+
+static void BNO085_SendBSQ(void)
+{
+    BNO085_SendByte(UART_FLAG_BYTE);
+    BNO085_SendByte(UART_PROTO_BSQ_BSN);
+    BNO085_SendByte(UART_FLAG_BYTE);
 }
 
 /**
- * @brief 发送SHTP命令
+ * @brief 发送UART-SHTP命令
  */
-static void BNO085_SendSHTPCommand(uint8_t channel, uint8_t *payload, uint16_t payload_len)
+static void BNO085_SendSHTPCommand(uint8_t channel, const uint8_t *payload, uint16_t payload_len)
 {
     uint8_t packet[32];
-    uint16_t total_len = payload_len + 4; // SHTP头4字节
+    uint16_t total_len = payload_len + 4U;
 
-    // 构建SHTP头
-    packet[0] = total_len & 0xFF;
-    packet[1] = (total_len >> 8) & 0x7F;
+    if (channel >= sizeof(shtp_sequence) || total_len > sizeof(packet)) {
+        return;
+    }
+
+    packet[0] = (uint8_t)(total_len & 0xFFU);
+    packet[1] = (uint8_t)((total_len >> 8) & 0x7FU);
     packet[2] = channel;
     packet[3] = shtp_sequence[channel]++;
 
-    // 复制payload
-    if (payload_len > 0 && payload_len <= 28) {
+    if (payload_len > 0U && payload != NULL) {
         memcpy(&packet[4], payload, payload_len);
     }
 
-    // 通过USART2发送（需要逐字节发送，保证字节间隔）
+    BNO085_SendByte(UART_FLAG_BYTE);
+    BNO085_SendByte(UART_PROTO_SHTP);
     for (uint16_t i = 0; i < total_len; i++) {
-        HAL_UART_Transmit(&huart2, &packet[i], 1, 10);
-        // 字节间隔至少100us（UART-SHTP要求）
-        HAL_Delay(1);
+        BNO085_SendEscaped(packet[i]);
     }
+    BNO085_SendByte(UART_FLAG_BYTE);
 }
 
 /**
@@ -69,7 +124,24 @@ static void BNO085_SendSHTPCommand(uint8_t channel, uint8_t *payload, uint16_t p
 void BNO085_SendProductIDRequest(void)
 {
     uint8_t payload[1] = {SHTP_CMD_PRODUCT_ID_REQUEST};
-    BNO085_SendSHTPCommand(SHTP_CHANNEL_CONTROL, payload, 1);
+    BNO085_SendSHTPCommand(SHTP_CHANNEL_CONTROL, payload, sizeof(payload));
+}
+
+static void BNO085_SetFeature(uint8_t report_id, uint32_t interval_us)
+{
+    uint8_t cmd[17] = {0};
+
+    cmd[0] = SHTP_CMD_SET_FEATURE;
+    cmd[1] = report_id;
+    cmd[2] = 0x00;
+    cmd[3] = 0x00;
+    cmd[4] = 0x00;
+    cmd[5] = (uint8_t)(interval_us & 0xFFU);
+    cmd[6] = (uint8_t)((interval_us >> 8) & 0xFFU);
+    cmd[7] = (uint8_t)((interval_us >> 16) & 0xFFU);
+    cmd[8] = (uint8_t)((interval_us >> 24) & 0xFFU);
+
+    BNO085_SendSHTPCommand(SHTP_CHANNEL_CONTROL, cmd, sizeof(cmd));
 }
 
 /**
@@ -78,28 +150,8 @@ void BNO085_SendProductIDRequest(void)
  */
 void BNO085_EnableRotationVector(uint16_t interval_ms)
 {
-    uint8_t cmd[17];
-
-    // Set Feature命令
-    cmd[0] = SHTP_CMD_SET_FEATURE;           // 0xFD
-    cmd[1] = REPORT_ID_ROTATION_VECTOR;      // 0x05
-    cmd[2] = 0x00;                           // 功能标志
-    cmd[3] = 0x00;                           // 敏感度
-
-    // 报告间隔（微秒，小端）
-    uint32_t interval_us = (uint32_t)interval_ms * 1000;
-    cmd[4] = interval_us & 0xFF;
-    cmd[5] = (interval_us >> 8) & 0xFF;
-    cmd[6] = (interval_us >> 16) & 0xFF;
-    cmd[7] = (interval_us >> 24) & 0xFF;
-
-    cmd[8] = 0x00;  // 批量状态
-    cmd[9] = 0x00;  // 传感器特定配置
-    cmd[10] = 0x00;
-    cmd[11] = 0x00;
-    cmd[12] = 0x00;
-
-    BNO085_SendSHTPCommand(SHTP_CHANNEL_CONTROL, cmd, 13);
+    BNO085_SetFeature(REPORT_ID_ROTATION_VECTOR, (uint32_t)interval_ms * 1000U);
+    BNO085_SetFeature(REPORT_ID_GAME_ROTATION_VECTOR, (uint32_t)interval_ms * 1000U);
 }
 
 /**
@@ -108,122 +160,150 @@ void BNO085_EnableRotationVector(uint16_t interval_ms)
  */
 void BNO085_EnableGyroCalibrated(uint16_t interval_ms)
 {
-    uint8_t cmd[17];
+    BNO085_SetFeature(REPORT_ID_GYRO_CALIBRATED, (uint32_t)interval_ms * 1000U);
+}
 
-    // Set Feature命令
-    cmd[0] = SHTP_CMD_SET_FEATURE;           // 0xFD
-    cmd[1] = REPORT_ID_GYRO_CALIBRATED;      // 0x02
-    cmd[2] = 0x00;                           // 功能标志
-    cmd[3] = 0x00;                           // 敏感度
-
-    // 报告间隔（微秒，小端）
-    uint32_t interval_us = (uint32_t)interval_ms * 1000;
-    cmd[4] = interval_us & 0xFF;
-    cmd[5] = (interval_us >> 8) & 0xFF;
-    cmd[6] = (interval_us >> 16) & 0xFF;
-    cmd[7] = (interval_us >> 24) & 0xFF;
-
-    cmd[8] = 0x00;  // 批量状态
-    cmd[9] = 0x00;  // 传感器特定配置
-    cmd[10] = 0x00;
-    cmd[11] = 0x00;
-    cmd[12] = 0x00;
-
-    BNO085_SendSHTPCommand(SHTP_CHANNEL_CONTROL, cmd, 13);
+static void BNO085_EnableReports(void)
+{
+    BNO085_EnableGyroCalibrated(5);
+    BNO085_EnableRotationVector(10);
+    bno085_reports_enabled = 1;
+    bno085_data.state = BNO085_STATE_CONFIGURING;
 }
 
 /**
  * @brief 解析旋转矢量报告
  */
-static void BNO085_ParseRotationVector(uint8_t *data, uint16_t len)
+static void BNO085_ParseRotationVector(const uint8_t *data, uint16_t len)
 {
-    if (len < 17) return; // 至少需要17字节
+    if (len < 12U) {
+        return;
+    }
 
-    bno085_data.rotation.status = data[1];
-    bno085_data.rotation.delay = (uint16_t)(data[2] | (data[3] << 8));
+    bno085_data.rotation.status = data[2] & 0x03U;
 
-    // 四元数（Q14格式，需要转换为float）
-    int16_t q1_raw = (int16_t)(data[4] | (data[5] << 8));
-    int16_t q2_raw = (int16_t)(data[6] | (data[7] << 8));
-    int16_t q3_raw = (int16_t)(data[8] | (data[9] << 8));
-    int16_t q4_raw = (int16_t)(data[10] | (data[11] << 8));
+    int16_t q1_raw = BNO085_ReadI16(data + 4);
+    int16_t q2_raw = BNO085_ReadI16(data + 6);
+    int16_t q3_raw = BNO085_ReadI16(data + 8);
+    int16_t q4_raw = BNO085_ReadI16(data + 10);
 
-    // Q14格式转换为float（范围-1到1）
     bno085_data.rotation.q1 = (float)q1_raw / 16384.0f;
     bno085_data.rotation.q2 = (float)q2_raw / 16384.0f;
     bno085_data.rotation.q3 = (float)q3_raw / 16384.0f;
     bno085_data.rotation.q4 = (float)q4_raw / 16384.0f;
 
-    // 转换为欧拉角
     BNO085_ConvertToEuler(&bno085_data.rotation);
+    bno085_data.data_ready = 1;
+
+    if (bno085_data.state == BNO085_STATE_CONFIGURING) {
+        bno085_data.state = BNO085_STATE_RUNNING;
+    }
 }
 
 /**
  * @brief 解析校准陀螺仪报告
  */
-static void BNO085_ParseGyroCalibrated(uint8_t *data, uint16_t len)
+static void BNO085_ParseGyroCalibrated(const uint8_t *data, uint16_t len)
 {
-    if (len < 16) return; // 至少需要16字节
+    if (len < 10U) {
+        return;
+    }
 
-    bno085_data.gyro.status = data[1];
-    bno085_data.gyro.delay = (uint16_t)(data[2] | (data[3] << 8));
+    bno085_data.gyro.status = data[2] & 0x03U;
 
-    // 角速度（Q9格式，单位rad/s）
-    int16_t x_raw = (int16_t)(data[4] | (data[5] << 8));
-    int16_t y_raw = (int16_t)(data[6] | (data[7] << 8));
-    int16_t z_raw = (int16_t)(data[8] | (data[9] << 8));
+    int16_t x_raw = BNO085_ReadI16(data + 4);
+    int16_t y_raw = BNO085_ReadI16(data + 6);
+    int16_t z_raw = BNO085_ReadI16(data + 8);
+    const float q9_to_rad_s = 1.0f / 512.0f;
 
-    // Q9格式转换为float（范围-256到256 rad/s）
-    bno085_data.gyro.x = (float)x_raw / 512.0f;
-    bno085_data.gyro.y = (float)y_raw / 512.0f;
-    bno085_data.gyro.z = (float)z_raw / 512.0f;
+    bno085_data.gyro.x = (float)x_raw * q9_to_rad_s;
+    bno085_data.gyro.y = (float)y_raw * q9_to_rad_s;
+    bno085_data.gyro.z = (float)z_raw * q9_to_rad_s;
+    bno085_data.data_ready = 1;
+
+    if (bno085_data.state == BNO085_STATE_CONFIGURING) {
+        bno085_data.state = BNO085_STATE_RUNNING;
+    }
 }
 
-/**
- * @brief 处理接收到的SHTP数据
- */
-void BNO085_ProcessData(uint8_t *data, uint16_t len)
+static void BNO085_ParseSensorReport(uint8_t channel, const uint8_t *payload, uint16_t len)
 {
-    if (len < 4) return; // 至少需要SHTP头
+    (void)channel;
 
-    SHTP_Header_t header;
-    BNO085_ParseSHTPHeader(data, &header);
+    while (len > 0U) {
+        uint8_t report_id = payload[0];
+        bno085_data.last_report = report_id;
 
-    // 检查长度是否有效
-    if (header.length > len) return;
+        if (report_id == 0xFBU) {
+            if (len < 5U) {
+                return;
+            }
+            payload += 5;
+            len = (uint16_t)(len - 5U);
+            continue;
+        }
 
-    uint8_t *payload = &data[4];
-    uint16_t payload_len = header.length - 4;
+        if (report_id == REPORT_ID_ROTATION_VECTOR || report_id == REPORT_ID_GAME_ROTATION_VECTOR) {
+            BNO085_ParseRotationVector(payload, len);
+            return;
+        }
 
-    // 根据通道处理
-    switch (header.channel) {
+        if (report_id == REPORT_ID_GYRO_CALIBRATED) {
+            BNO085_ParseGyroCalibrated(payload, len);
+            return;
+        }
+
+        return;
+    }
+}
+
+static void BNO085_ParseSHTPPacket(const uint8_t *packet, uint16_t len)
+{
+    if (len < 4U) {
+        bno085_data.rx_bad++;
+        return;
+    }
+
+    uint16_t packet_len = (uint16_t)(packet[0] | ((packet[1] & 0x7FU) << 8));
+    uint8_t channel = packet[2];
+
+    if (packet_len < 4U || packet_len > len || channel > SHTP_CHANNEL_GYRO_ROTATION) {
+        bno085_data.rx_bad++;
+        return;
+    }
+
+    const uint8_t *payload = packet + 4;
+    uint16_t payload_len = (uint16_t)(packet_len - 4U);
+
+    bno085_data.rx_bytes += packet_len;
+    bno085_data.rx_packets++;
+    bno085_data.last_len = packet_len;
+    bno085_data.last_channel = channel;
+    bno085_data.last_report = payload_len > 0U ? payload[0] : 0U;
+
+    if (bno085_data.state == BNO085_STATE_WAIT_RESET) {
+        bno085_data.state = BNO085_STATE_READY;
+        bno085_data.initialized = 1;
+    }
+
+    switch (channel) {
+        case SHTP_CHANNEL_EXECUTABLE:
+            if (payload_len > 0U && payload[0] == 0x01U) {
+                bno085_data.state = BNO085_STATE_READY;
+                bno085_data.initialized = 1;
+            }
+            break;
+
         case SHTP_CHANNEL_CONTROL:
-            // 控制通道响应（如Product ID Response）
-            if (payload_len > 0 && payload[0] == SHTP_CMD_PRODUCT_ID_RESPONSE) {
-                // 收到Product ID响应，说明通信正常
+            if (payload_len > 0U && payload[0] == SHTP_CMD_PRODUCT_ID_RESPONSE) {
                 bno085_data.initialized = 1;
             }
             break;
 
         case SHTP_CHANNEL_REPORT:
+        case SHTP_CHANNEL_WAKE_REPORT:
         case SHTP_CHANNEL_GYRO_ROTATION:
-            // 传感器报告
-            if (payload_len > 0) {
-                switch (payload[0]) {
-                    case REPORT_ID_ROTATION_VECTOR:
-                        BNO085_ParseRotationVector(payload, payload_len);
-                        bno085_data.data_ready = 1;
-                        break;
-
-                    case REPORT_ID_GYRO_CALIBRATED:
-                        BNO085_ParseGyroCalibrated(payload, payload_len);
-                        bno085_data.data_ready = 1;
-                        break;
-
-                    default:
-                        break;
-                }
-            }
+            BNO085_ParseSensorReport(channel, payload, payload_len);
             break;
 
         default:
@@ -231,52 +311,128 @@ void BNO085_ProcessData(uint8_t *data, uint16_t len)
     }
 }
 
-/**
- * @brief 将USART2 DMA收到的数据追加到BNO085环形缓冲区
- */
-void BNO085_PushRxData(uint8_t *data, uint16_t len)
+static void BNO085_ParseUARTFrame(const uint8_t *frame, uint16_t len)
 {
-    if (!bno085_ring_inited || data == NULL || len == 0) {
+    if (len < 1U) {
         return;
     }
 
-    for (uint16_t i = 0; i < len; i++) {
-        if (RingBuffer_IsFull(&bno085_ring)) {
-            (void)RingBuffer_ReadByte(&bno085_ring);
-            bno085_rx_overflow_count++;
+    if (frame[0] == UART_PROTO_BSQ_BSN) {
+        if (len >= 3U) {
+            bno085_data.tx_space = (uint16_t)frame[1] | ((uint16_t)frame[2] << 8);
         }
-        RingBuffer_WriteByte(&bno085_ring, data[i]);
+        return;
+    }
+
+    if (frame[0] == UART_PROTO_SHTP) {
+        BNO085_ParseSHTPPacket(frame + 1, (uint16_t)(len - 1U));
+    }
+}
+
+static void BNO085_ParseUARTByte(uint8_t b)
+{
+    if (b == UART_FLAG_BYTE) {
+        if (uart_in_frame && uart_frame_len > 0U) {
+            BNO085_ParseUARTFrame(uart_frame, uart_frame_len);
+        }
+        uart_in_frame = 1;
+        uart_escape = 0;
+        uart_frame_len = 0;
+        return;
+    }
+
+    if (!uart_in_frame) {
+        return;
+    }
+
+    if (b == UART_ESCAPE_BYTE) {
+        uart_escape = 1;
+        return;
+    }
+
+    if (uart_escape) {
+        b ^= UART_ESCAPE_XOR;
+        uart_escape = 0;
+    }
+
+    if (uart_frame_len < sizeof(uart_frame)) {
+        uart_frame[uart_frame_len++] = b;
+    } else {
+        bno085_data.rx_bad++;
+        uart_in_frame = 0;
+        uart_escape = 0;
+        uart_frame_len = 0;
+    }
+}
+
+static void BNO085_ParseRxStream(void)
+{
+    uint16_t write_pos;
+
+    if (huart2.hdmarx == NULL) {
+        return;
+    }
+
+    write_pos = (uint16_t)(BNO085_DMA_BUF_SIZE - __HAL_DMA_GET_COUNTER(huart2.hdmarx));
+    bno085_data.dma_pos = write_pos;
+
+    while (bno085_last_read_pos != write_pos) {
+        BNO085_ParseUARTByte(BNO085_DmaRead(bno085_last_read_pos));
+        bno085_last_read_pos = (uint16_t)((bno085_last_read_pos + 1U) % BNO085_DMA_BUF_SIZE);
     }
 }
 
 /**
- * @brief 从环形缓冲区按SHTP length拆出完整包并解析
+ * @brief 处理接收到的SHTP数据
  */
-void BNO085_Service(void)
+void BNO085_ProcessData(uint8_t *data, uint16_t len)
 {
-    if (!bno085_ring_inited) {
+    BNO085_ParseSHTPPacket(data, len);
+}
+
+/**
+ * @brief 兼容旧ReceiveToIdle路径：将收到的数据按UART-SHTP流解析
+ */
+void BNO085_PushRxData(uint8_t *data, uint16_t len)
+{
+    if (data == NULL) {
         return;
     }
 
-    while (RingBuffer_GetByteUsed(&bno085_ring) >= 4U) {
-        uint8_t len_l = RingBuffer_PeekByte(&bno085_ring, 0);
-        uint8_t len_h = RingBuffer_PeekByte(&bno085_ring, 1);
-        uint8_t channel = RingBuffer_PeekByte(&bno085_ring, 2);
-        uint16_t packet_len = (uint16_t)(len_l | ((len_h & 0x7FU) << 8));
+    bno085_rx_len = len;
+    for (uint16_t i = 0; i < len; i++) {
+        BNO085_ParseUARTByte(data[i]);
+    }
+}
 
-        // 长度或通道异常时丢1字节重新同步，避免错位后永久卡住。
-        if (packet_len < 4U || packet_len > BNO085_PACKET_MAX || channel > SHTP_CHANNEL_GYRO_ROTATION) {
-            (void)RingBuffer_ReadByte(&bno085_ring);
-            bno085_bad_packet_count++;
-            continue;
+/**
+ * @brief 从DMA循环缓冲解析UART-SHTP数据，并推进初始化状态机
+ */
+void BNO085_Service(void)
+{
+    BNO085_ParseRxStream();
+
+    bno085_data.uart_error = HAL_UART_GetError(&huart2);
+
+    if ((bno085_data.state == BNO085_STATE_READY) && !bno085_reports_enabled) {
+        if (bno085_data.tx_space >= 80U) {
+            BNO085_EnableReports();
+        } else if ((HAL_GetTick() - bno085_last_bsq_ms) >= 20U) {
+            bno085_last_bsq_ms = HAL_GetTick();
+            BNO085_SendBSQ();
         }
+    }
+}
 
-        if (RingBuffer_GetByteUsed(&bno085_ring) < packet_len) {
-            break;
-        }
-
-        RingBuffer_ReadByteArray(&bno085_ring, bno085_packet_buf, packet_len);
-        BNO085_ProcessData(bno085_packet_buf, packet_len);
+/**
+ * @brief USART2 IDLE中断入口
+ */
+void BNO085_IRQHandler(void)
+{
+    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE)) {
+        __HAL_UART_CLEAR_IDLEFLAG(&huart2);
+        bno085_data.idle_irq++;
+        bno085_frame_ready = 1;
     }
 }
 
@@ -285,25 +441,28 @@ void BNO085_Service(void)
  */
 void BNO085_ConvertToEuler(RotationVector_t *rv)
 {
-    float q1 = rv->q1, q2 = rv->q2, q3 = rv->q3, q4 = rv->q4;
+    float qi = rv->q1;
+    float qj = rv->q2;
+    float qk = rv->q3;
+    float qr = rv->q4;
+    const float rad_to_deg = 180.0f / M_PI;
 
-    // Roll (X轴旋转)
-    float sinr_cosp = 2.0f * (q1 * q2 + q3 * q4);
-    float cosr_cosp = 1.0f - 2.0f * (q2 * q2 + q3 * q3);
-    rv->roll = atan2f(sinr_cosp, cosr_cosp) * 180.0f / 3.14159265f;
+    float sinr_cosp = 2.0f * (qr * qi + qj * qk);
+    float cosr_cosp = 1.0f - 2.0f * (qi * qi + qj * qj);
+    rv->roll = atan2f(sinr_cosp, cosr_cosp) * rad_to_deg;
 
-    // Pitch (Y轴旋转)
-    float sinp = 2.0f * (q1 * q3 - q4 * q2);
-    if (fabsf(sinp) >= 1.0f) {
-        rv->pitch = copysignf(90.0f, sinp); // 万向节锁
+    float sinp = 2.0f * (qr * qj - qk * qi);
+    if (sinp >= 1.0f) {
+        rv->pitch = 90.0f;
+    } else if (sinp <= -1.0f) {
+        rv->pitch = -90.0f;
     } else {
-        rv->pitch = asinf(sinp) * 180.0f / 3.14159265f;
+        rv->pitch = asinf(sinp) * rad_to_deg;
     }
 
-    // Yaw (Z轴旋转)
-    float siny_cosp = 2.0f * (q1 * q4 + q2 * q3);
-    float cosy_cosp = 1.0f - 2.0f * (q3 * q3 + q4 * q4);
-    rv->yaw = atan2f(siny_cosp, cosy_cosp) * 180.0f / 3.14159265f;
+    float siny_cosp = 2.0f * (qr * qk + qi * qj);
+    float cosy_cosp = 1.0f - 2.0f * (qj * qj + qk * qk);
+    rv->yaw = atan2f(siny_cosp, cosy_cosp) * rad_to_deg;
 }
 
 /**
@@ -311,30 +470,26 @@ void BNO085_ConvertToEuler(RotationVector_t *rv)
  */
 void BNO085_Init(void)
 {
-    // 清空数据
     memset(&bno085_data, 0, sizeof(BNO085_Data_t));
+    memset(bno085_rx_buf, 0, sizeof(bno085_rx_buf));
+    memset(shtp_sequence, 0, sizeof(shtp_sequence));
+
     bno085_rx_len = 0;
     bno085_frame_ready = 0;
-    RingBuffer_Init(&bno085_ring, BNO085_RING_CAPACITY, bno085_ring_storage);
-    bno085_ring_inited = 1;
-    bno085_rx_overflow_count = 0;
-    bno085_bad_packet_count = 0;
+    uart_frame_len = 0;
+    uart_in_frame = 0;
+    uart_escape = 0;
+    bno085_last_read_pos = 0;
+    bno085_last_bsq_ms = 0;
+    bno085_reports_enabled = 0;
+    bno085_data.state = BNO085_STATE_WAIT_RESET;
 
-    // 等待BNO085启动（H_INTN拉低表示就绪）
     HAL_Delay(100);
 
-    // 先启动USART2 DMA接收，避免初始化阶段响应包丢失。
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, bno085_rx_buf, 256);
+    __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
+    bno085_data.rx_status = HAL_UART_Receive_DMA(&huart2, bno085_rx_buf, sizeof(bno085_rx_buf));
 
-    // 发送Product ID请求验证通信
+    HAL_Delay(20);
     BNO085_SendProductIDRequest();
-    HAL_Delay(50);
-
-    // 使能旋转矢量（10ms间隔 = 100Hz）
-    BNO085_EnableRotationVector(10);
-    HAL_Delay(10);
-
-    // 使能校准陀螺仪（10ms间隔 = 100Hz）
-    BNO085_EnableGyroCalibrated(10);
-    HAL_Delay(10);
+    BNO085_SendBSQ();
 }

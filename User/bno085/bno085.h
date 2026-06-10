@@ -53,6 +53,18 @@ typedef struct {
     GyroCalibrated_t gyro;
     uint8_t initialized;
     uint8_t data_ready;
+    uint8_t state;
+    uint8_t rx_status;
+    uint8_t last_channel;
+    uint8_t last_report;
+    uint16_t tx_space;
+    uint16_t dma_pos;
+    uint16_t rx_packets;
+    uint16_t rx_bad;
+    uint16_t last_len;
+    uint32_t rx_bytes;
+    uint32_t idle_irq;
+    uint32_t uart_error;
 } BNO085_Data_t;
 
 // 函数声明
@@ -64,10 +76,11 @@ void BNO085_SendProductIDRequest(void);
 void BNO085_EnableRotationVector(uint16_t interval_ms);
 void BNO085_EnableGyroCalibrated(uint16_t interval_ms);
 void BNO085_ConvertToEuler(RotationVector_t *rv);
+void BNO085_IRQHandler(void);
 
 // 外部变量
 extern BNO085_Data_t bno085_data;
-extern uint8_t bno085_rx_buf[256];
+extern uint8_t bno085_rx_buf[512];
 extern volatile uint16_t bno085_rx_len;
 extern volatile uint8_t bno085_frame_ready;
 

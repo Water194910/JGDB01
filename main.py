@@ -37,7 +37,7 @@ class KalmanFilter1D:
 # 创建dx/dy的卡尔曼滤波器
 # process_noise: 越小越平滑但响应慢
 # measurement_noise: 越大越信任预测值
-kf_dx = KalmanFilter1D(process_noise=0.05, measurement_noise=3.0)
+kf_dx = KalmanFilter1D(process_noise=0.5, measurement_noise=1.5)
 kf_dy = KalmanFilter1D(process_noise=0.05, measurement_noise=3.0)
 
 # ---------- 串口配置 ----------
@@ -103,7 +103,7 @@ while not app.need_exit():
         det_img = img.resize(det_w, det_h)
     else:
         det_img = img
-    objs = detector.detect(det_img, conf_th=0.1, iou_th=0.45)
+    objs = detector.detect(det_img, conf_th=0.2, iou_th=0.45)
 
     a4_list = [o for o in objs if o.class_id == 0]
     a4 = max(a4_list, key=lambda o: o.score) if a4_list else None

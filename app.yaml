@@ -1,0 +1,8 @@
+id: ew25
+name: 25EW
+version: 1.0.0
+author: Water
+icon: app.png
+desc: 哈吉马路哟
+files:
+  - main.py
